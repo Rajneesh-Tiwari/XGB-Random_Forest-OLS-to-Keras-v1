@@ -1,0 +1,494 @@
+import numpy as np
+import pandas as pd
+import os
+import gc
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn import model_selection, preprocessing
+import xgboost as xgb
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.linear_model import ElasticNet
+from sklearn.svm import SVR
+from sklearn.base import TransformerMixin
+import math
+from sklearn import datasets, linear_model
+from keras.layers import Dense, Dropout, Activation
+from keras.models import Sequential
+from keras.layers import Dense
+from keras.wrappers.scikit_learn import KerasRegressor
+from sklearn.model_selection import cross_val_score
+from sklearn.model_selection import KFold
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import mean_squared_error
+
+
+%matplotlib inline
+
+path = 'C:/Users/RAJNEESH TIWARI/Downloads/Russian Housing prediction'
+train = pd.read_csv(os.path.join(path,"train.csv"))
+test = pd.read_csv(os.path.join(path,"test.csv"))
+macro = pd.read_csv(os.path.join(path,"macro.csv"))
+submission = pd.read_csv(os.path.join(path,"sample_submission.csv"))
+
+train = pd.merge(train, macro, how='left', on='timestamp')
+test = pd.merge(test, macro, how='left', on='timestamp')
+print(train.shape, test.shape)
+
+trainsub = train[train.timestamp < '2015-01-01']
+trainsub = trainsub[trainsub.product_type=="Investment"]
+
+ind_1m = trainsub[trainsub.price_doc <= 1000000].index
+ind_2m = trainsub[trainsub.price_doc == 2000000].index
+ind_3m = trainsub[trainsub.price_doc == 3000000].index
+
+train_index = set(train.index.copy())
+
+for ind, gap in zip([ind_1m, ind_2m, ind_3m], [10, 3, 2]):
+    ind_set = set(ind)
+    ind_set_cut = ind.difference(set(ind[::gap]))
+
+    train_index = train_index.difference(ind_set_cut)
+
+train = train.loc[train_index]
+
+### these var have created enough issues already
+issues = ['child_on_acc_pre_school','modern_education_share', 'old_education_build_share']
+train.drop(issues,inplace=True,axis=1)
+test.drop(issues,inplace=True,axis=1)
+train.loc[train.state == 33,'state'] = train['state'].mode()[0]
+train.loc[train.build_year == 20052009,'build_year'] = 2007
+
+test.dropna(how="all", axis=1)
+train.dropna(how="all", axis=1)
+
+col_test = test.columns
+col_train = train.columns
+col_train_unique = set(col_train)
+intersection = [val for val in col_test if val in col_train_unique]
+print (intersection)
+
+price_doc = train['price_doc']
+train = train[intersection]
+test = test[intersection]
+train['price_doc'] = price_doc
+
+#### Imputer function for missing data
+def imputer (dataframe,impute_continuous = True, impute_categorical=True):
+    categorical = []
+    continuous = []
+    for f in dataframe.columns:
+        if train[f].dtype=='object':
+            categorical.append(f)
+        else:
+            continuous.append(f)
+            
+    #print (categorical)
+    #print (continuous)
+    if (impute_continuous):
+        for c in continuous:
+            if pd.isnull(dataframe[c].mean()):
+                fill = -99
+                dataframe[c].fillna(fill,inplace=True)
+                print ("filling -99 for ",c)
+            else:
+                dataframe[c].fillna(dataframe[c].mean(), inplace=True)
+                print (c+"_mean is_" + str(dataframe[c].mean()))
+                print ("-------------------------")
+    
+    print ("===============================================")
+    
+    if (impute_categorical):
+        for c in categorical:
+            if pd.isnull(dataframe[c].mode()[0]):
+                fill = -99
+                dataframe[c].fillna(fill,inplace=True)
+                print ("filling -99 for ",c)
+            else:
+                dataframe[c].fillna(dataframe[c].mode()[0],inplace=True)
+                print (c+"_mode is_" + str(dataframe[c].mode()[0]))
+                print ("-------------------------")
+                
+#A function to calculate Root Mean Squared Logarithmic Error (RMSLE)
+def rmsle(y, y_pred):
+    assert len(y) == len(y_pred)
+    terms_to_sum = [(math.log(y_pred[i] + 1) - math.log(y[i] + 1)) ** 2.0 for i,pred in enumerate(y_pred)]
+    return (sum(terms_to_sum) * (1.0/len(y))) ** 0.5
+    return dataframe
+    
+## We do 9 XGBs+3RFs+1 OLS -- total of 13 meta featues that will be fed to the final keras deep net
+
+def meta_feature(raw_train, raw_test,XGB=True,RF=True,OLS=True,SVR=True):
+    Percentage_missing_train = raw_train.apply(lambda x: sum(x.isnull().values)*100/len(x), axis = 0)
+    Percentage_missing_test = raw_test.apply(lambda x: sum(x.isnull().values)*100/len(x), axis = 0)
+    
+    to_remove = []
+    for i in Percentage_missing_test[Percentage_missing_test==100].index:
+        to_remove.append(i)
+    
+    raw_train.drop(to_remove,inplace=True,axis=1)
+    raw_test.drop(to_remove,inplace=True,axis=1)
+    
+    train_imputed = imputer (dataframe=raw_train,impute_continuous = True, impute_categorical=True)
+    test_imputed = imputer (dataframe=raw_test,impute_continuous = True, impute_categorical=True) 
+    
+    #sets = [train_imputed, raw_train]
+    categorical_var =[]
+    for f in train_imputed.ix[:, train_imputed.columns != 'timestamp'].columns:
+        if train_imputed[f].dtype=='object':
+            print(f)
+            categorical_var.append(f)
+            lbl = preprocessing.LabelEncoder()
+            lbl.fit(list(train_imputed[f].values.astype('str')) + list(test_imputed[f].values.astype('str')))
+            train_imputed[f] = lbl.transform(list(train_imputed[f].values.astype('str')))
+            test_imputed[f] = lbl.transform(list(test_imputed[f].values.astype('str')))
+                
+    categorical_var =[]
+    for f in raw_train.ix[:, raw_train.columns != 'timestamp'].columns:
+        if raw_train[f].dtype=='object':
+            print(f)
+            categorical_var.append(f)
+            lbl = preprocessing.LabelEncoder()
+            lbl.fit(list(raw_train[f].values.astype('str')) + list(raw_test[f].values.astype('str')))
+            raw_train[f] = lbl.transform(list(raw_train[f].values.astype('str')))
+            raw_test[f] = lbl.transform(list(raw_test[f].values.astype('str')))
+                
+    #to_remove = []
+    #for i in Percentage_missing_test[Percentage_missing_test==100].index:
+    #    to_remove.append(i)   
+    
+    train_imputed_columns_rf = list(set(train_imputed.select_dtypes(include=['float64', 'int64']).columns) - set(['id', 'timestamp', 'price_doc'])-set(to_remove))
+    y_train_rf = train_imputed['price_doc'].values
+    x_train_rf = train_imputed[train_imputed_columns_rf].values
+    x_test_rf = test_imputed[train_imputed_columns_rf].values
+             
+            
+    train_columns_ni = list(set(raw_train.select_dtypes(include=['float64', 'int64']).columns) - set(['id', 'timestamp', 'price_doc']))
+    y_train_ni = raw_train['price_doc'].values
+    x_train_ni = raw_train[train_columns_ni].values
+    x_test_ni = raw_test[train_columns_ni].values   ### ni is not imputed
+    
+    test_size = 0.4
+    X_train_ni, X_test_ni, Y_train_ni, Y_test_ni = train_test_split(x_train_ni, y_train_ni, test_size=test_size, random_state=1234)
+    X_train_rf, X_test_rf, Y_train_rf, Y_test_rf = train_test_split(x_train_rf, y_train_rf, test_size=test_size, random_state=1234)
+
+    #### xgb 3 sets
+    if (XGB):
+        params_1 = {
+        'max_depth':9,
+        'min_child_weight':3,
+        'learning_rate':0.25,
+        'subsample':0.8,
+        'colsample_bytree':0.8,   
+        'obj':'reg:linear',
+        'reg_lambda':1,
+        'reg_alpha':0,          
+        'n_estimators':500
+        #,'min_split_loss':0
+        ,'rate_drop':0.2
+        }
+
+        T_train_xgb = xgb.DMatrix(X_train_ni, Y_train_ni)
+        xgb_1 = xgb.train(dtrain=T_train_xgb,params=params_1)
+        Test_Meta_features1 = xgb_1.predict(xgb.DMatrix(x_test_ni))
+        Train_Meta_Features1 = xgb_1.predict(xgb.DMatrix(x_train_ni))
+        print("len of train meta features 1:", len(Train_Meta_Features1))
+        print ("==========  end of 1st xgb iteration =============\n")
+        
+        '''
+        thresholds = sort(xgb_1.feature_importances_)
+        for thresh in thresholds:
+         # select features using threshold
+            selection = SelectFromModel(xgb_1, threshold=thresh, prefit=True)
+            select_X_train = selection.transform(X_train_ni)
+            # train model
+            selection_model = XGBRegressor ()
+            selection_model.fit(select_X_train, y_train_ni)
+            # eval model
+            select_X_test = selection.transform(X_test_ni)
+            y_pred = selection_model.predict(select_X_test)
+            #predictions = [round(value) for value in y_pred]
+            RMSLE = RMSLE(Y_test_ni, y_pred)
+            print("RMSLE for 1st XGB is:",RMSLE)
+        '''
+     ###########################################################################   
+        params_2 = {'max_depth':7,
+        'learning_rate':0.25,
+        'subsample':0.8,
+        'colsample_bytree':0.8,   
+        'obj':'reg:linear',
+        #'reg_alpha':0.8,
+       'n_estimators':1000,
+       'eta':0.3}
+
+        #T_train_xgb_2 = xgb.DMatrix(X_train_ni, Y_train_ni)
+        xgb_2 = xgb.train(dtrain=T_train_xgb,params=params_2)
+        Test_Meta_features2 = xgb_2.predict(xgb.DMatrix(x_test_ni))
+        Train_Meta_Features2 = xgb_2.predict(xgb.DMatrix(x_train_ni))
+        print("len of train meta features 2:", len(Train_Meta_Features2))
+        print ("==========  end of 2nd xgb iteration =============\n")
+     
+    ###########################################################################   
+        params_3 = {'max_depth':7,
+        'min_child_weight':7,
+        'learning_rate':0.25,
+        'subsample':0.8,
+        'colsample_bytree':0.8,   
+        'obj':'reg:linear',
+        'reg_lambda':0.85,
+        'reg_alpha':0.1,
+        #'reg_alpha':0.8,
+        'n_estimators':1200,
+        'eta':0.25}
+
+        #T_train_xgb_2 = xgb.DMatrix(X_train_ni, Y_train_ni)
+        xgb_3 = xgb.train(dtrain=T_train_xgb,params=params_3)
+        Test_Meta_features3 = xgb_3.predict(xgb.DMatrix(x_test_ni))
+        Train_Meta_Features3 = xgb_3.predict(xgb.DMatrix(x_train_ni))
+        print("len of train meta features 3:", len(Train_Meta_Features3))
+        print ("==========  end of 3rd xgb iteration =============\n")
+        #return Train_Meta_Features1,Train_Meta_Features2,Train_Meta_Features3
+        
+     ##########################################################################
+    
+        params_4 = {'max_depth':10,
+        'min_child_weight':7,
+        'learning_rate':0.25,
+        'subsample':0.85,
+        'colsample_bytree':0.85,   
+        'obj':'reg:linear',
+        'reg_lambda':1,
+        'reg_alpha':0,
+        #'reg_alpha':0.8,
+        'n_estimators':500,
+        'eta':0.25}
+
+        #T_train_xgb_2 = xgb.DMatrix(X_train_ni, Y_train_ni)
+        xgb_4 = xgb.train(dtrain=T_train_xgb,params=params_4)
+        Test_Meta_features4 = xgb_4.predict(xgb.DMatrix(x_test_ni))
+        Train_Meta_Features4 = xgb_4.predict(xgb.DMatrix(x_train_ni))
+        print("len of train meta features 4:", len(Train_Meta_Features4))
+        print ("==========  end of 4th xgb iteration =============\n")
+        #return Train_Meta_Features1,Train_Meta_Features2,Train_Meta_Features3
+
+      ##########################################################################
+    
+        params_5 = {'max_depth':4,
+        'min_child_weight':4,
+        'learning_rate':0.25,
+        'subsample':0.8,
+        'colsample_bytree':0.8,   
+        'obj':'reg:linear',
+        'reg_lambda':0.85,
+        'reg_alpha':0.1,
+        #'reg_alpha':0.8,
+        'n_estimators':1200,
+        'eta':0.25}
+
+        #T_train_xgb_2 = xgb.DMatrix(X_train_ni, Y_train_ni)
+        xgb_5 = xgb.train(dtrain=T_train_xgb,params=params_5)
+        Test_Meta_features5 = xgb_5.predict(xgb.DMatrix(x_test_ni))
+        Train_Meta_Features5 = xgb_5.predict(xgb.DMatrix(x_train_ni))
+        print("len of train meta features 5:", len(Train_Meta_Features5))
+        print ("==========  end of 5th xgb iteration =============\n")
+        #return Train_Meta_Features1,Train_Meta_Features2,Train_Meta_Features3
+
+        ##########################################################################
+    
+        params_6 = {'max_depth':12,
+        'min_child_weight':5,
+        'learning_rate':0.25,
+        'subsample':1,
+        'colsample_bytree':1,   
+        'obj':'reg:linear',
+        'reg_lambda':0,
+        'reg_alpha':0,
+        #'reg_alpha':0.8,
+        'n_estimators':1500,
+        'eta':0.25}
+
+        #T_train_xgb_2 = xgb.DMatrix(X_train_ni, Y_train_ni)
+        xgb_6 = xgb.train(dtrain=T_train_xgb,params=params_6)
+        Test_Meta_features6 = xgb_6.predict(xgb.DMatrix(x_test_ni))
+        Train_Meta_Features6 = xgb_6.predict(xgb.DMatrix(x_train_ni))
+        print("len of train meta features 6:", len(Train_Meta_Features6))
+        print ("==========  end of 6th xgb iteration =============\n")
+        ##########################################################################
+    
+        params_7 = {'max_depth':3,
+        'min_child_weight':10,
+        'learning_rate':0.25,
+        'subsample':0.8,
+        'colsample_bytree':0.8,   
+        'obj':'reg:linear',
+        'reg_lambda':0.8,
+        'reg_alpha':0.05,
+        #'reg_alpha':0.8,
+        'n_estimators':1000,
+        'eta':0.25}
+
+        #T_train_xgb_2 = xgb.DMatrix(X_train_ni, Y_train_ni)
+        xgb_7 = xgb.train(dtrain=T_train_xgb,params=params_7)
+        Test_Meta_features7 = xgb_7.predict(xgb.DMatrix(x_test_ni))
+        Train_Meta_Features7 = xgb_7.predict(xgb.DMatrix(x_train_ni))
+        print("len of train meta features 7:", len(Train_Meta_Features7))
+        print ("==========  end of 7th xgb iteration =============\n")
+
+        ##########################################################################
+    
+        params_8 = {'max_depth':8,
+        'min_child_weight':4,
+        'learning_rate':0.25,
+        'subsample':0.8,
+        'colsample_bytree':0.8,   
+        'obj':'reg:linear',
+        'reg_lambda':0.85,
+        'reg_alpha':0.1,
+        #'reg_alpha':0.8,
+        'n_estimators':1250,
+        'eta':0.25}
+
+        #T_train_xgb_2 = xgb.DMatrix(X_train_ni, Y_train_ni)
+        xgb_8 = xgb.train(dtrain=T_train_xgb,params=params_8)
+        Test_Meta_features8 = xgb_8.predict(xgb.DMatrix(x_test_ni))
+        Train_Meta_Features8 = xgb_8.predict(xgb.DMatrix(x_train_ni))
+        print("len of train meta features 8:", len(Train_Meta_Features8))
+        print ("==========  end of 8th xgb iteration =============\n")
+        
+        ##########################################################################
+    
+        T_train_xgb_imputed = xgb.DMatrix(X_train_rf, Y_train_rf)
+        params_9 = {'max_depth':8,
+        'min_child_weight':7,
+        'learning_rate':0.25,
+        'subsample':0.8,
+        'colsample_bytree':0.8,   
+        'obj':'reg:linear',
+        'reg_lambda':1,
+        'reg_alpha':0,
+        #'reg_alpha':0.8,
+        'n_estimators':1500,
+        'eta':0.25}
+
+        #T_train_xgb_2 = xgb.DMatrix(X_train_ni, Y_train_ni)
+        xgb_9 = xgb.train(dtrain=T_train_xgb_imputed,params=params_9)
+        Test_Meta_features9 = xgb_8.predict(xgb.DMatrix(x_test_rf))
+        Train_Meta_Features9 = xgb_8.predict(xgb.DMatrix(x_train_rf))
+        print("len of train meta features 9:", len(Train_Meta_Features9))
+        print ("==========  end of 9th xgb iteration ============= \n")
+
+    ###########################################################################          
+
+        
+    ###########################################################################          
+
+    ############################ Random forest ################################
+    ###########################################################################          
+    
+    if(RF):
+        #test_size = 0.4
+        #X_train_rf, X_test_rf, Y_train_rf, Y_test_rf = train_test_split(x_train_rf, y_train_rf, test_size=test_size, random_state=1234)
+
+        rf1 = RandomForestRegressor(n_estimators=300, max_depth = 10,min_samples_split=100,n_jobs =-1)
+        rf1.fit(X_train_rf, Y_train_rf)
+        Train_Meta_Features_rf1 = rf1.predict(x_train_rf)
+        Test_Meta_features_rf1 = rf1.predict(x_test_rf)
+        #rmsle(Y_test_rf,RF_Pred)
+        print ("==========  end of 1st RF iteration =============")
+
+         ###########################################################################          
+        rf2 = RandomForestRegressor(n_estimators=450, max_depth = 8,min_samples_split=50,n_jobs =-1)
+        rf2.fit(X_train_rf, Y_train_rf)
+        Train_Meta_Features_rf2 = rf2.predict(x_train_rf)
+        Test_Meta_features_rf2 = rf2.predict(x_test_rf)
+        #rmsle(Y_test_rf,RF_Pred)
+        print ("==========  end of 2nd RF iteration =============")
+
+         ###########################################################################          
+        rf3 = RandomForestRegressor(n_estimators=750, max_depth = 6,min_samples_split=150,n_jobs =-1)
+        rf3.fit(X_train_rf, Y_train_rf)
+        Train_Meta_Features_rf3 = rf3.predict(x_train_rf)
+        Test_Meta_features_rf3 = rf3.predict(x_test_rf)
+        #rmsle(Y_test_rf,RF_Pred)
+        print ("==========  end of 3rd RF iteration =============")
+
+        
+        ########################## OLS #############################################
+        
+    if (OLS):
+        regr = linear_model.LinearRegression(fit_intercept=True,normalize=True)
+        regr.fit(X_train_rf, Y_train_rf)
+        OLS_Train_Features = regr.predict(x_train_rf)
+        OLS_Test_Features = regr.predict(x_test_rf)
+        print ("==========  end of OLS iteration =============")
+        
+    return (Train_Meta_Features1,Train_Meta_Features2,Train_Meta_Features3,Train_Meta_Features4,
+           Train_Meta_Features5,Train_Meta_Features6,Train_Meta_Features7,Train_Meta_Features8,Train_Meta_Features9,OLS_Train_Features,
+           Train_Meta_Features_rf1,Train_Meta_Features_rf2,Train_Meta_Features_rf3,
+           Test_Meta_features1,Test_Meta_features2,Test_Meta_features3,Test_Meta_features4,
+           Test_Meta_features5,Test_Meta_features6,Test_Meta_features7,Test_Meta_features8,Test_Meta_features9,OLS_Test_Features,
+           Test_Meta_features_rf1,Test_Meta_features_rf2,Test_Meta_features_rf3,           
+           y_train_ni)
+  
+  ##########################################################################
+
+Train_Meta_Features1,Train_Meta_Features2,Train_Meta_Features3,Train_Meta_Features4,Train_Meta_Features5,Train_Meta_Features6,Train_Meta_Features7,Train_Meta_Features8,Train_Meta_Features9,OLS_Train_Features,Train_Meta_Features_rf1,Train_Meta_Features_rf2,Train_Meta_Features_rf3,Test_Meta_features1,Test_Meta_features2,Test_Meta_features3,Test_Meta_features4,Test_Meta_features5,Test_Meta_features6,Test_Meta_features7,Test_Meta_features8,Test_Meta_features9,OLS_Test_Features,Test_Meta_features_rf1,Test_Meta_features_rf2,Test_Meta_features_rf3,y_train_ni = meta_feature(raw_train=train, raw_test=test,XGB=True,RF=True,OLS=True,SVR=True)
+
+x_train_meta = np.column_stack((Train_Meta_Features1,Train_Meta_Features2,Train_Meta_Features3,Train_Meta_Features4,
+Train_Meta_Features5,Train_Meta_Features6,Train_Meta_Features7,Train_Meta_Features8,Train_Meta_Features9,OLS_Train_Features,
+Train_Meta_Features_rf1,Train_Meta_Features_rf2,Train_Meta_Features_rf3)).astype(float)
+
+x_test_meta =np.column_stack((Test_Meta_features1,Test_Meta_features2,Test_Meta_features3,Test_Meta_features4,
+Test_Meta_features5,Test_Meta_features6,Test_Meta_features7,Test_Meta_features8,Test_Meta_features9,OLS_Test_Features,
+Test_Meta_features_rf1,Test_Meta_features_rf2,Test_Meta_features_rf3)).astype(float)
+
+meta_test.columns = "feature"+meta_test.columns
+meta_train.columns= "feature"+meta_train.columns
+y_train_ni.columns = ["Price"]
+
+meta_test = meta_test.values
+meta_train = meta_train.values
+y_train_ni = y_train_ni.values
+
+test_size = 0.33
+X_tr, X_test, Y_tr, Y_test = train_test_split(meta_train, y_train_ni, test_size=test_size, random_state=1234)
+#X_tr = X_tr.values
+#X_test = X_test.values
+#Y_tr = Y_tr.values
+#Y_test=Y_test.values
+#X_tr = pd.DataFrame(x_train_meta)
+#Y = pd.DataFrame(y_train_ni)
+#Y.columns = ['price']
+
+def base_model():
+    model = Sequential()
+    model.add(Dense(13, input_dim=13, init='normal', activation='relu'))
+    model.add(Dense(32, init='normal', activation='relu'))
+    #model.add(Dense(32, init='normal', activation='relu'))
+    #model.add(Dropout(0.05))
+    #model.add(Dense(24, init='normal', activation='relu'))
+    #model.add(Dropout(0.5))  ##a
+    model.add(Dense(16, init='normal', activation='relu')) ### a
+    model.add(Dense(32, init='normal', activation='relu')) ###a
+    model.add(Dropout(0.5))
+    model.add(Dense(1, init='normal'))
+    model.compile(loss='mean_squared_error', optimizer = 'adam')
+    return model
+
+seed = 7
+np.random.seed(seed)
+
+#scale = StandardScaler()
+#X_tr = scale.fit_transform(X_tr)
+#X_test = scale.fit_transform(X_test)
+
+clf = KerasRegressor(build_fn=base_model, nb_epoch=500, batch_size=25,verbose=0)
+
+clf.fit(X_tr,Y_tr)
+#res = clf.predict(X_test)
+
+mse_score = mean_squared_error(Y_test, clf.predict(X_test))
+rmsle_score = rmsle(Y_test, clf.predict(X_test))
+print (rmsle_score)
